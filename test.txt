@@ -1,0 +1,2060 @@
+# === rbdo6/__init__.py ===
+from .core import *
+from .correlation import *
+from .provider import *
+from .variable import *
+from .reliability import *
+
+import torch
+
+
+# === rbdo6/core/context.py ===
+# ============================================================
+# File        : context.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Manages the global context for variable registration,
+#               sampling inputs, and tracking execution statistics.
+#               Provides access to design and random variables and
+#               ensures proper gradient handling for optimization.
+# ============================================================
+
+import torch
+
+
+class Context:
+    """
+    Global context for managing design and random variables in RBDO.
+
+    This context tracks:
+    - Registered design and random variables
+    - Input values for u (standard normal) and v (design variables)
+    - Execution statistics for forward and backward passes
+
+    Only one context can be active at a time, and it must be accessed using a `with` statement.
+    """
+
+    _active = None  # Static reference to the currently active context
+
+    def __init__(self):
+        """
+        Initializes an empty context with variable lists and statistics.
+        """
+        self.design = []  # List of registered design variables
+        self.random = []  # List of registered random variables
+
+        self.stats = {
+            "forward_calls": 0,
+            "blackbox_forward": 0,
+            "blackbox_backward": 0
+        }
+
+    def __enter__(self):
+        """
+        Enters the context, making it the globally active context.
+        """
+        Context._active = self
+        return self
+
+    def __exit__(self, *args):
+        """
+        Exits the context, deactivating it.
+        """
+        Context._active = None
+
+    def register_design(self, var):
+        """
+        Registers a design variable with the context.
+
+        Args:
+            var: A DesignVariable instance.
+        """
+        var._id = len(self.design)
+        self.design.append(var)
+
+    def register_random(self, var):
+        """
+        Registers a random variable with the context.
+
+        Args:
+            var: A RandomVariable instance.
+        """
+        var._id = len(self.random)
+        self.random.append(var)
+
+    @staticmethod
+    def active():
+        """
+        Returns the currently active context.
+
+        Returns:
+            Context: The currently active context.
+
+        Raises:
+            RuntimeError: If no context is currently active.
+        """
+        if Context._active is None:
+            raise RuntimeError("No active context.")
+        return Context._active
+
+
+# === rbdo6/core/index.py ===
+# ============================================================
+# File        : index_node.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements a node that extracts a specific
+#               column (feature) from a batched input tensor.
+# ============================================================
+
+from .node import *
+
+
+class IndexNode(Node):
+    """
+    Node that selects a single column (feature) from a batched input tensor.
+
+    Useful for extracting individual components from a multi-dimensional output.
+
+    Attributes:
+        index (int): Index of the column to extract from the input tensor.
+    """
+
+    def __init__(self, index, source_node):
+        """
+        Initializes an IndexNode that selects the i-th column from its input.
+
+        Args:
+            index (int): Index of the column to extract.
+            source_node (Node): The upstream node providing a [B, N] output.
+        """
+        super().__init__([source_node])
+        self.index = index
+
+    def forward(self, ctx, x):
+        """
+        Forwards the selected column from the input.
+
+        Args:
+            x (torch.Tensor): Batched input tensor of shape [B, N].
+
+        Returns:
+            torch.Tensor: Extracted column vector of shape [B].
+        """
+        return x[:, self.index]
+
+
+# === rbdo6/core/node.py ===
+# ============================================================
+# File        : node.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Defines the base class for all computational
+#               nodes in the computation graph. Handles forward
+#               evaluation, gradient and Hessian computation,
+#               as well as Hessian-vector products.
+#               Supports numerical differentiation via providers.
+# ============================================================
+
+from .context import Context
+from torch.autograd.functional import hvp
+import torch
+
+
+class NumericalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, fn, grad_provider, *inputs):
+        ctx.fn = fn
+        ctx.grad_provider = grad_provider
+        ctx.save_for_backward(*inputs)
+        return fn(*inputs)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs = ctx.saved_tensors
+        fn = ctx.fn
+        provider = ctx.grad_provider
+
+        y0 = fn(*inputs)
+        grads = provider.compute_gradients(fn, inputs, y0)
+        grad_output = grad_output.view(-1, 1)
+
+        return (None, None, *[grad_output * g for g in grads])
+
+
+
+class Node:
+    """
+    Base class for all computation graph nodes.
+
+    A Node represents a differentiable operation that can be part of a
+    computational graph, enabling forward evaluation, backward gradients,
+    Hessians, and Hessian-vector products (HVPs). Supports batching over inputs.
+
+    Attributes:
+        inputs (list): Upstream nodes or constant values.
+        _uses_numerical (bool): Whether any input node or this node uses numerical derivatives.
+        grad_provider (GradientProvider): Optional numerical gradient provider.
+        hvp_provider (callable): Optional user-defined Hessian-vector product.
+        hesse_provider (callable): Optional user-defined full Hessian provider.
+    """
+
+    def __init__(self, inputs=None):
+        """
+        Initializes a Node and inspects its inputs.
+
+        Args:
+            inputs (list, optional): Upstream nodes or constants.
+        """
+        self.inputs = inputs if inputs else []
+        self._uses_numerical = any(getattr(inp, "_uses_numerical", False) for inp in self.inputs)
+        self.grad_provider = None
+        self.hvp_provider = None
+        self.hesse_provider = None
+
+    def set_gradient_provider(self, provider):
+        """
+        Registers a custom gradient provider for numerical differentiation.
+
+        Args:
+            provider (GradientProvider): Object with .compute_gradients(fn, inputs).
+        """
+        self.grad_provider = provider
+        self._uses_numerical = True
+
+    def add_hvp_provider(self, provider):
+        """
+        Registers a custom Hessian-vector product provider.
+
+        Args:
+            provider (callable): Function (self, v) → hvp result.
+        """
+        self.hvp_provider = provider
+
+    def add_hesse_provider(self, provider):
+        """
+        Registers a custom full Hessian provider.
+
+        Args:
+            provider (callable): Function (self) → Hessian.
+        """
+        self.hesse_provider = provider
+
+    def hvp_u(self, v):
+        """
+        Computes HVP with respect to u using the registered provider.
+
+        Args:
+            v (torch.Tensor): Vector to multiply with Hessian.
+
+        Returns:
+            torch.Tensor: Hessian-vector product result.
+        """
+        if self.hvp_provider is None:
+            raise RuntimeError("No HVP provider set.")
+        return self.hvp_provider(self, v)
+
+    def hesse_u(self):
+        """
+        Computes full Hessian with respect to u using the registered provider.
+
+        Returns:
+            torch.Tensor: Full Hessian matrix.
+        """
+        if self.hesse_provider is None:
+            raise RuntimeError("No Hesse provider set.")
+        return self.hesse_provider(self)
+
+    def forward(self, ctx, *args):
+        """
+        Must be implemented by subclasses to define the computation.
+
+        Args:
+            ctx (Context): Current active context.
+            *args: Input values from upstream nodes.
+
+        Returns:
+            torch.Tensor: Output tensor of shape [B].
+        """
+        raise NotImplementedError
+
+    def call(self, u=None, v=None, grad=False, gradgrad_u=False, gradgrad_v=False, hvp_u=None, hvp_v=None,
+             _internal=False):
+        ctx = Context.active()
+
+        # Evaluate input nodes recursively
+        values = []
+        for inp in self.inputs:
+            if isinstance(inp, Node):
+                values.append(inp.call(u, v, _internal=True)["out"])
+            else:
+                values.append(inp)
+
+        ctx.stats["forward_calls"] += 1
+
+        def fwd_fn(*args):
+            return self.forward(ctx, *args)
+
+        if self.grad_provider is not None:
+            out = NumericalFunction.apply(fwd_fn, self.grad_provider, *values)
+        else:
+            out = self.forward(ctx, *values)
+
+        result = {"out": out}
+
+        if _internal:
+            return result
+
+        # First-order gradients
+        if grad:
+            grad_inputs = [u, v]
+            result.update(self._compute_gradients_autodiff(out, grad_inputs))
+
+        # Hessians
+        if gradgrad_u:
+            result["hess_u"] = self._compute_hessian(lambda x: self.call(u=x, v=v, grad=True, _internal=True)["out"], u)
+
+        if gradgrad_v:
+            result["hess_v"] = self._compute_hessian(lambda x: self.call(u=u, v=x, grad=True, _internal=True)["out"], v)
+
+        # HVPs
+        if hvp_u is not None:
+            result["hvp_u"] = self._compute_hvp(lambda x: self.call(u=x, v=v, grad=False)["out"], u, hvp_u)
+
+        if hvp_v is not None:
+            result["hvp_v"] = self._compute_hvp(lambda x: self.call(u=u, v=x, grad=False)["out"], v, hvp_v)
+
+        result["stats"] = dict(ctx.stats)
+        return result
+
+    # === Update _compute_gradients_autodiff ===
+    def _compute_gradients_autodiff(self, out, inputs):
+        grads = torch.autograd.grad(out, inputs, grad_outputs=torch.ones_like(out), retain_graph=True,
+                                    allow_unused=True)
+        return {
+            "grad_u": grads[0],
+            "grad_v": grads[1] if len(grads) > 1 else None
+        }
+
+    def _compute_hessian(self, func, x):
+        return torch.autograd.functional.hessian(func, x)
+
+    def _compute_hvp(self, func, x, v):
+        _, hvp_val = torch.autograd.functional.hvp(func, x, v)
+        return hvp_val
+
+
+
+# === rbdo6/core/__init__.py ===
+# ============================================================
+# File        : __init__.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Core module initialization. Re-exports essential
+#               classes for context management and computation nodes.
+# ============================================================
+
+from .context import Context
+from .node import Node
+from .index import IndexNode
+
+__all__ = [
+    "Context",
+    "Node",
+    "IndexNode",
+]
+
+
+# === rbdo6/core/__pycache__/context.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/core/__pycache__/index.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/core/__pycache__/node.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/core/__pycache__/__init__.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/correlation/correlation.py ===
+
+import torch
+from ..core import Context
+
+class CorrelationMatrix:
+    def __init__(self):
+        self.random_vars = Context.active().random
+        self.n = len(self.random_vars)
+        self.R = torch.eye(self.n)
+        self.L = None
+        self._dirty = True
+
+    def set_correlation(self, r1, r2, rho):
+        i, j = r1._id, r2._id
+        self.R[i, j] = self.R[j, i] = rho
+        self._dirty = True
+
+    def compile(self):
+        self.L = torch.linalg.cholesky(self.R).to(dtype=torch.float32)
+        self._dirty = False
+
+    def get_L(self):
+        if self._dirty:
+            raise RuntimeError("CorrelationMatrix not compiled.")
+        return self.L
+
+
+# === rbdo6/correlation/nataf.py ===
+
+from ..core import Node
+
+class NatafTransformation(Node):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, ctx):
+        L = ctx.corr.get_L()  # [n, n]
+        u = ctx.u  # [B, n]
+
+        return u @ L.T  # [B, n]
+
+# === rbdo6/correlation/realization.py ===
+from ..core import Node, IndexNode
+import torch
+
+class Realization(Node):
+    def __init__(self, z_node, corr):
+        super().__init__([z_node])
+        self.random_vars = corr.random_vars
+
+    def forward(self, ctx, z):  # z: [B, N]
+        x_list = []
+        for i, rv in enumerate(self.random_vars):
+            z_i = z[:, i]  # [B]
+            x_i = rv.sample(z_i)  # [B]
+            x_list.append(x_i.unsqueeze(1))  # [B,1]
+        return torch.cat(x_list, dim=1)  # [B, N]
+
+    def __getitem__(self, rv):
+        return IndexNode(rv._id, self)
+
+
+
+# === rbdo6/correlation/__init__.py ===
+from .correlation import *
+from .nataf import *
+from .realization import *
+
+# === rbdo6/correlation/__pycache__/correlation.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/correlation/__pycache__/nataf.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/correlation/__pycache__/realization.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/correlation/__pycache__/__init__.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/provider/hvp_fdiff.py ===
+import torch
+from ..core import Context
+
+class HVP_FDiff_Provider:
+    def __init__(self, eps=1e-2):
+        self.eps = eps
+
+    def __call__(self, node, v):
+        ctx = Context.active()
+        u_base = ctx.u.detach().clone()
+        v = v.detach()
+
+        def func(u_):
+            ctx.set_inputs(u_.requires_grad_(True), ctx.v)
+            return node.call(grad=True)["out"]
+
+        u_plus = (u_base + self.eps * v).requires_grad_(True)
+        ctx.set_inputs(u_plus, ctx.v)
+        g1 = torch.autograd.grad(func(u_plus), u_plus, retain_graph=False)[0]
+
+        u_base.requires_grad_(True)
+        ctx.set_inputs(u_base, ctx.v)
+        g0 = torch.autograd.grad(func(u_base), u_base, retain_graph=False)[0]
+
+        return (g1 - g0) / self.eps
+
+# === rbdo6/provider/__init__.py ===
+from .hvp_fdiff import *
+from .grad import *
+
+# === rbdo6/provider/grad/gradient_central.py ===
+# ============================================================
+# File        : gradient_central.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements central finite-difference gradients
+#               for black-box functions in batched form.
+# ============================================================
+
+import torch
+from .gradient_provider import GradientProvider
+
+
+class CentralDifference(GradientProvider):
+    """
+    Finite-difference gradient provider using central differences.
+
+    Approximates ∂y/∂x using the formula:
+        (f(x + ε) - f(x - ε)) / (2ε)
+    """
+
+    def __init__(self, eps=1e-4):
+        """
+        Initializes the central-difference provider.
+
+        Args:
+            eps (float): Perturbation size ε for the finite difference.
+        """
+        self.eps = eps
+
+    def compute_gradients(self, fn, inputs, y0=None):
+        """
+        Computes ∂y/∂x using central differences.
+
+        Args:
+            fn (callable): Function to differentiate.
+            inputs (List[Tensor]): Batched input tensors.
+            y0 (Tensor, optional): Cached fn(*inputs), unused here.
+
+        Returns:
+            List[Tensor]: List of gradients with shape [B, D_i] for each input i.
+        """
+        grads = []
+
+        for i, x in enumerate(inputs):
+            B, D = x.shape if x.ndim == 2 else (x.shape[0], 1)
+            x = x.view(B, D)
+            dx = torch.zeros_like(x)
+
+            for j in range(D):
+                x_p = x.clone()
+                x_m = x.clone()
+                x_p[:, j] += self.eps
+                x_m[:, j] -= self.eps
+
+                x_inputs_p = list(inputs)
+                x_inputs_m = list(inputs)
+                x_inputs_p[i] = x_p
+                x_inputs_m[i] = x_m
+
+                y1 = fn(*x_inputs_p)
+                y2 = fn(*x_inputs_m)
+
+                dx[:, j] = (y1 - y2) / (2 * self.eps)
+
+            grads.append(dx)
+
+        return grads
+
+
+# === rbdo6/provider/grad/gradient_forward.py ===
+# ============================================================
+# File        : gradient_forward.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements forward finite-difference gradients
+#               for black-box functions in batched form.
+# ============================================================
+
+import torch
+from .gradient_provider import GradientProvider
+
+
+class ForwardDifference(GradientProvider):
+    """
+    Finite-difference gradient provider using forward differences.
+
+    Approximates ∂y/∂x using the formula:
+        (f(x + ε) - f(x)) / ε
+    """
+
+    def __init__(self, eps=1e-2):
+        """
+        Initializes the forward-difference provider.
+
+        Args:
+            eps (float): Perturbation size ε for the finite difference.
+        """
+        self.eps = eps
+
+    def compute_gradients(self, fn, inputs, y0=None):
+        """
+        Computes ∂y/∂x using forward differences.
+
+        Args:
+            fn (callable): Function to differentiate.
+            inputs (List[Tensor]): Batched input tensors.
+            y0 (Tensor, optional): Cached fn(*inputs).
+
+        Returns:
+            List[Tensor]: List of gradients with shape [B, D_i] for each input i.
+        """
+        grads = []
+        if y0 is None:
+            y0 = fn(*inputs)
+
+        for i, x in enumerate(inputs):
+            B, D = x.shape if x.ndim == 2 else (x.shape[0], 1)
+            x = x.view(B, D)
+            dx = torch.zeros_like(x)
+
+            for j in range(D):
+                x_pert = x.clone()
+                x_pert[:, j] += self.eps
+
+                x_inputs = list(inputs)
+                x_inputs[i] = x_pert
+
+                y1 = fn(*x_inputs)
+                dx[:, j] = (y1 - y0) / self.eps
+
+            grads.append(dx)
+
+        return grads
+
+
+# === rbdo6/provider/grad/gradient_provider.py ===
+# ============================================================
+# File        : gradient_provider.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Defines an abstract interface for gradient
+#               providers, allowing different differentiation
+#               schemes (e.g., forward, central) to be plugged
+#               into black-box nodes.
+# ============================================================
+
+
+class GradientProvider:
+    """
+    Abstract base class for black-box gradient providers.
+
+    Subclasses must implement the `compute_gradients` method
+    which approximates ∂y/∂x for all input tensors using a
+    custom finite-difference or other scheme.
+    """
+
+    def compute_gradients(self, fn, inputs, y0=None):
+        """
+        Computes ∂y/∂x using a custom gradient approximation method.
+
+        Args:
+            fn (callable): The function whose gradient is being computed.
+            inputs (List[Tensor]): Input tensors of shape [B, D] or [B].
+            y0 (Tensor, optional): Cached output of fn(*inputs). Reused if available.
+
+        Returns:
+            List[Tensor]: Approximated gradients ∂y/∂xi for each input tensor.
+        """
+        raise NotImplementedError("GradientProvider requires implementation.")
+
+
+# === rbdo6/provider/grad/__init__.py ===
+from .gradient_forward import *
+from .gradient_central import *
+from .gradient_provider import *
+
+# === rbdo6/provider/grad/__pycache__/gradient_central.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/provider/grad/__pycache__/gradient_forward.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/provider/grad/__pycache__/gradient_provider.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/provider/grad/__pycache__/__init__.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/provider/__pycache__/hvp_fdiff.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/provider/__pycache__/__init__.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/reliability/form.py ===
+# ============================================================
+# File        : form.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the First-Order Reliability Method (FORM)
+#               using the HL-RF algorithm with autograd support.
+# ============================================================
+
+import math
+import torch
+from torch.special import erf
+from ..core import Node, Context
+
+
+class FORMFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, form_node, g_node, u, v, max_iter, tol, eta):
+        with torch.enable_grad():
+            B, n_u = u.shape
+            ctx.g_node = g_node
+            ctx.u = u
+            ctx.v = v
+            ctx.max_iter = max_iter
+            ctx.tol = tol
+            ctx.eta = eta
+            ctx.form_node = form_node
+
+            ctx.u_star = torch.zeros_like(u)
+            ctx.beta = torch.zeros(B, device=u.device, dtype=u.dtype)
+            ctx.du = []
+            ctx.dv = []
+
+            pf_out = torch.zeros(B, device=u.device, dtype=u.dtype)
+
+            for b in range(B):
+                u_b = torch.zeros(n_u, device=u.device, dtype=u.dtype)
+                v_b = v[b]
+
+                # Evaluate g at origin to determine sign of β
+                g0_tmp = torch.zeros(1, n_u, device=u.device, dtype=u.dtype).requires_grad_(True)
+                v_tmp = v_b.unsqueeze(0).clone().detach().requires_grad_(True)
+                Context.active().set_inputs(g0_tmp, v_tmp)
+                res0 = g_node.call(u=g0_tmp, v=v_tmp, grad=False)
+                sign = -1.0 if res0["out"].item() < 0 else 1.0
+
+                # HLRF Iteration
+                for _ in range(max_iter):
+                    u_tmp = u_b.unsqueeze(0).clone().detach().requires_grad_(True)
+                    v_tmp = v_b.unsqueeze(0).clone().detach().requires_grad_(True)
+
+                    res = g_node.call(u=u_tmp, v=v_tmp, grad=True)
+                    g_val = res["out"].item()
+                    du = res["grad_u"].squeeze(0)
+                    norm2 = du.dot(du).item()
+
+                    if abs(g_val) < tol or norm2 == 0.0:
+                        break
+
+                    lam = (du @ u_b - g_val) / norm2
+                    u_new = u_b + eta * (lam * du - u_b)
+                    if (u_new - u_b).norm().item() < tol:
+                        u_b = u_new
+                        break
+                    u_b = u_new
+
+                # Final call to get gradients at u*
+                u_tmp = u_b.unsqueeze(0).clone().detach().requires_grad_(True)
+                v_tmp = v_b.unsqueeze(0).clone().detach().requires_grad_(True)
+                Context.active().set_inputs(u_tmp, v_tmp)
+
+                res = g_node.call(u=u_tmp, v=v_tmp, grad=True)
+                du = res["grad_u"].squeeze(0)
+                dv = res["grad_v"].squeeze(0)
+
+                β = sign * u_b.norm()
+                pf_val = 0.5 * (1.0 - erf(β / math.sqrt(2.0)))
+
+                pf_out[b] = pf_val
+                ctx.u_star[b] = u_b
+                ctx.beta[b] = β
+                ctx.du.append(du)
+                ctx.dv.append(dv)
+
+            # Store result on the calling FORM instance
+            form_node._last_beta = ctx.beta.detach().clone()
+
+            return pf_out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        u, v = ctx.u, ctx.v
+        B, n_u = u.shape
+        n_v = v.shape[1]
+        grad_u = torch.zeros_like(u)
+        grad_v = torch.zeros_like(v)
+
+        for b in range(B):
+            du = ctx.du[b]
+            dv = ctx.dv[b]
+            β = ctx.beta[b]
+            norm_du = du.norm().item()
+
+            if norm_du == 0.0:
+                dpf_dg = 0.0
+            else:
+                dpf_dg = -math.exp(-β.item() ** 2 / 2.0) / math.sqrt(2.0 * math.pi) / norm_du
+
+            grad_u[b] = dpf_dg * du * grad_out[b]
+            grad_v[b] = dpf_dg * dv * grad_out[b]
+
+        return None, None, grad_u, grad_v, None, None, None
+
+
+class FORM(Node):
+    """
+    First-Order Reliability Method (FORM) node using the HL-RF algorithm.
+
+    Computes the probability of failure Pf ≈ Φ(-β), where β is the reliability index.
+    """
+
+    def __init__(self, g_node, max_iter=50, tol=1e-6, eta=1.0):
+        """
+        Initializes the FORM node.
+
+        Args:
+            g_node (Node): The limit state function node.
+            max_iter (int): Maximum number of HL-RF iterations.
+            tol (float): Convergence tolerance.
+            eta (float): Step size factor for HL-RF update.
+        """
+        super().__init__([g_node])
+        self.g_node = g_node
+        self.max_iter = max_iter
+        self.tol = tol
+        self.eta = eta
+        self._last_beta = None  # updated after each forward pass
+
+    def forward(self, ctx: Context, *_):
+        """
+        Executes the HL-RF algorithm and returns Pf.
+
+        Args:
+            ctx (Context): Active computation context.
+
+        Returns:
+            torch.Tensor: Vector of failure probabilities (shape [B]).
+        """
+        u, v = ctx.u, ctx.v
+        pf = FORMFunction.apply(self, self.g_node, u, v, self.max_iter, self.tol, self.eta)
+        return pf
+
+    def beta(self):
+        """
+        Returns the reliability indices β from the most recent forward pass.
+
+        Returns:
+            torch.Tensor: Tensor of β values (shape [B]) or None if not computed.
+        """
+        return self._last_beta
+
+
+# === rbdo6/reliability/importance_sampling.py ===
+# ============================================================
+# File        : importance_sampling.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Importance Sampling with automatic u* estimation using HLRF.
+# ============================================================
+
+import math
+import torch
+from ..core import Node, Context
+
+
+class ImportanceSampling(Node):
+    """
+    Importance Sampling node using u* computed from HL-RF (same as FORM).
+    Evaluates Pf = E_q[𝟙[g(u,v) < 0] w(u)], where q = N(u*, I) and
+    w(u) = φ(u) / q(u) = exp(-u*·(u - 0.5·u*)).
+
+    Attributes:
+        g_node (Node): Limit state function node.
+        n_samples (int): Number of importance samples.
+        max_iter (int): Max iterations for HL-RF.
+        tol (float): Convergence tolerance for HL-RF.
+    """
+
+    def __init__(self, g_node: Node, n_samples: int = 10000, max_iter: int = 50, tol: float = 1e-6):
+        super().__init__([g_node])
+        self.g_node = g_node
+        self.n_samples = n_samples
+        self.max_iter = max_iter
+        self.tol = tol
+        self._u_star = None
+        self._pf = None
+        self._samples = None
+
+    def forward(self, ctx: Context, *_):
+        """
+        Runs HL-RF to find u*, then estimates Pf via importance sampling.
+
+        Returns:
+            torch.Tensor: Estimated failure probability.
+        """
+        device = ctx.v.device
+        n_dim  = len(ctx.random)
+
+        # === Compute u* via HL-RF
+        u_b = torch.zeros(n_dim, device=device, dtype=torch.float32)
+        v_b = ctx.v.squeeze(0).detach()
+
+        for _ in range(self.max_iter):
+            u_tmp = u_b.unsqueeze(0).clone().detach().requires_grad_(True)
+            v_tmp = v_b.unsqueeze(0).clone().detach().requires_grad_(True)
+
+            Context.active().set_inputs(u_tmp, v_tmp)
+            res = self.g_node.call(u=u_tmp, v=v_tmp, grad=True)
+            g_val = res["out"].item()
+            du = res["grad_u"].squeeze(0)
+            norm2 = du.dot(du).item()
+
+            if abs(g_val) < self.tol or norm2 == 0.0:
+                break
+
+            lam = (du @ u_b - g_val) / norm2
+            u_new = u_b + (lam * du - u_b)
+            if (u_new - u_b).norm().item() < self.tol:
+                u_b = u_new
+                break
+            u_b = u_new
+
+        self._u_star = u_b.detach()
+
+        # === Importance sampling
+        u_samples = torch.randn(self.n_samples, n_dim, device=device, dtype=torch.float32) + self._u_star
+        v_batch   = ctx.v.expand(self.n_samples, -1)
+
+        res = self.g_node.call(u=u_samples, v=v_batch, grad=False)
+        g_vals = res["out"].squeeze()
+
+        # Importance weight: w(u) = exp(-u*·(u - 0.5 u*))
+        dot = torch.einsum("ij,j->i", u_samples, self._u_star)
+        u_star_sq = torch.dot(self._u_star, self._u_star).item()
+        weights = torch.exp(-dot + 0.5 * u_star_sq)
+
+        indicator = (g_vals < 0).float()
+        weighted = indicator * weights
+        pf = weighted.mean()
+
+        self._samples = g_vals.detach().cpu()
+        self._pf = pf.item()
+        return torch.tensor(self._pf, device=device, dtype=torch.float32)
+
+    def confidence_interval(self, level: float = 0.95) -> tuple[float, float]:
+        """
+        Computes a symmetric confidence interval for the IS estimate using the
+        sample standard deviation of the weighted estimator.
+        """
+        if self._samples is None or self._u_star is None:
+            raise RuntimeError("Importance Sampling not yet run.")
+
+        from scipy.stats import norm
+        z = norm.ppf(0.5 + level / 2)
+
+        u = self._u_star
+        u_samples = self._samples.to(dtype=u.dtype, device=u.device)
+        n = self.n_samples
+
+        # Reconstruct weights and indicators
+        u_raw = torch.randn(n, len(u), device=u.device) + u
+        dot = torch.einsum("ij,j->i", u_raw, u)
+        u_norm2 = torch.dot(u, u).item()
+        weights = torch.exp(-dot + 0.5 * u_norm2)
+
+        # Re-evaluate g (reusing stored values if you stored them)
+        v_batch = Context.active().v.expand(n, -1)
+        res = self.inputs[0].call(u=u_raw, v=v_batch, grad=False)
+        g_vals = res["out"].squeeze()
+        indicator = (g_vals < 0).float()
+
+        y = indicator * weights
+        std = y.std(unbiased=True).item() / math.sqrt(n)
+        delta = z * std
+
+        return self._pf - delta, self._pf + delta
+
+    @property
+    def pf(self) -> float:
+        """Returns last computed Pf."""
+        return self._pf
+
+    @property
+    def samples(self) -> torch.Tensor:
+        """Returns last evaluated g values."""
+        return self._samples
+
+    @property
+    def u_star(self) -> torch.Tensor:
+        """Returns computed u* from HL-RF iteration."""
+        return self._u_star
+
+
+# === rbdo6/reliability/mc.py ===
+import torch
+from ..core import Node, Context
+
+
+class MonteCarlo(Node):
+    """
+    Monte Carlo Node for estimating the failure probability Pf = P[g(u,v) < 0].
+
+    Attributes:
+        n_samples (int): Number of Monte Carlo samples.
+
+    Properties:
+        samples (torch.Tensor): Evaluated g values from last call.
+        pf (float): Estimated failure probability from last call.
+    """
+
+    def __init__(self, g_node: Node, n_samples: int = 10_000):
+        """
+        Initializes the Monte Carlo estimator.
+
+        Args:
+            g_node (Node): Limit state function node.
+            n_samples (int): Number of Monte Carlo samples.
+        """
+        super().__init__([g_node])
+        self.n_samples = n_samples
+        self._samples = None
+        self._pf = None
+
+    def forward(self, ctx: Context, *_):
+        """
+        Performs Monte Carlo sampling in standard normal space and estimates Pf.
+
+        Args:
+            ctx (Context): Active computation context with .u, .v, and .random.
+
+        Returns:
+            torch.Tensor: Scalar tensor representing estimated failure probability.
+        """
+        device = ctx.v.device
+        dtype = ctx.v.dtype
+
+        # Generate samples in standard normal space for all random variables
+        u_samples = torch.randn(self.n_samples, len(ctx.random), device=device, dtype=torch.float32)
+
+        # Duplicate the design variables for batch evaluation
+        v_batch = ctx.v.expand(self.n_samples, -1)
+
+        # Evaluate limit state function g(u,v) for all samples
+        res = self.inputs[0].call(u=u_samples, v=v_batch, grad=False)
+        g_vals = res["out"].squeeze()
+
+        # Store raw results and failure probability
+        self._samples = g_vals.detach().cpu()
+        self._pf = (g_vals < 0).float().mean().item()
+
+        # Return estimated Pf as tensor
+        return torch.tensor(self._pf, device=device, dtype=dtype)
+
+    def confidence_interval(self, level: float = 0.95) -> tuple[float, float]:
+        """
+        Computes a symmetric confidence interval for the failure probability.
+
+        Args:
+            level (float): Confidence level (default: 0.95)
+
+        Returns:
+            Tuple (lower_bound, upper_bound): Error bars around Pf
+        """
+        if self._pf is None:
+            raise RuntimeError("Monte Carlo not yet evaluated.")
+
+        # z-value for given confidence level (e.g., 1.96 for 95%)
+        from scipy.stats import norm
+        z = norm.ppf(0.5 + level / 2)
+
+        # Standard deviation of Bernoulli estimator
+        std = (self._pf * (1 - self._pf) / self.n_samples) ** 0.5
+        delta = z * std
+
+        return (self._pf - delta, self._pf + delta)
+
+    @property
+    def pf(self) -> float:
+        """
+        Returns the last computed failure probability.
+
+        Returns:
+            float: Pf from last forward pass.
+        """
+        return self._pf
+
+    @property
+    def samples(self) -> torch.Tensor:
+        """
+        Returns the raw evaluated g values from the last forward pass.
+
+        Returns:
+            torch.Tensor: Sampled g(u,v) values.
+        """
+        return self._samples
+
+
+# === rbdo6/reliability/__init__.py ===
+from .form import *
+from .mc import *
+from .importance_sampling import *
+
+# === rbdo6/reliability/__pycache__/form.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/reliability/__pycache__/importance_sampling.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/reliability/__pycache__/mc.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/reliability/__pycache__/__init__.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/bernoulli.py ===
+# ============================================================
+# File        : bernoulli.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Bernoulli random variable using
+#               inverse transform sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Bernoulli(RandomVariable):
+    """
+    Bernoulli random variable with success probability p.
+
+    Standard normal samples are mapped to uniform values, then compared
+    to p to generate binary outcomes in {0, 1}.
+
+    Attributes:
+        p (DesignVariable or float): Probability of success (0 ≤ p ≤ 1).
+    """
+
+    def __init__(self, p):
+        """
+        Initializes a Bernoulli random variable and registers it with the context.
+
+        Args:
+            p (float or DesignVariable): Probability of success.
+        """
+        super().__init__()
+        self.p = p
+
+    def sample(self, z_i):
+        """
+        Samples from the Bernoulli distribution using inverse transform sampling.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples of 0 or 1 from the Bernoulli(p) distribution (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
+        p = self.get_value(self.p)
+        return (U < p).float()
+
+
+# === rbdo6/variable/beta.py ===
+# ============================================================
+# File        : beta.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Beta random variable using
+#               inverse CDF sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Beta(RandomVariable):
+    """
+    Beta random variable with shape parameters α and β.
+
+    Transforms standard normal samples into Beta-distributed values using
+    inverse transform sampling via the Beta distribution's CDF.
+
+    Attributes:
+        alpha (DesignVariable or float): First shape parameter (α > 0).
+        beta (DesignVariable or float): Second shape parameter (β > 0).
+    """
+
+    def __init__(self, alpha, beta):
+        """
+        Initializes a Beta random variable and registers it with the context.
+
+        Args:
+            alpha (float or DesignVariable): Shape parameter α.
+            beta (float or DesignVariable): Shape parameter β.
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def sample(self, z_i):
+        """
+        Samples from the Beta distribution using inverse transform sampling.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from the Beta(α, β) distribution (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
+        alpha = self.get_value(self.alpha)
+        beta  = self.get_value(self.beta)
+        dist = torch.distributions.Beta(alpha, beta)
+        return dist.icdf(U)
+
+
+# === rbdo6/variable/categorical.py ===
+# ============================================================
+# File        : categorical.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Categorical random variable using
+#               inverse transform sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Categorical(RandomVariable):
+    """
+    Categorical random variable representing a discrete probability distribution.
+
+    Transforms standard normal samples to category indices using inverse transform sampling.
+    The input z_i is mapped to uniform values and compared against the cumulative probability
+    mass function to determine sampled indices.
+
+    Attributes:
+        probs (DesignVariable or torch.Tensor): A [B, N] tensor of category probabilities per sample.
+    """
+
+    def __init__(self, probs):
+        """
+        Initializes a Categorical random variable and registers it with the context.
+
+        Args:
+            probs (DesignVariable or torch.Tensor): Tensor of category probabilities (shape [B, N]).
+        """
+        super().__init__()
+        self.probs = probs
+
+    def sample(self, z_i):
+        """
+        Samples category indices from the categorical distribution using inverse transform sampling.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Sampled category indices (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
+        probs = self.get_value(self.probs)  # [B, N]
+        cdf = torch.cumsum(probs, dim=1)    # [B, N]
+        sample = (U.unsqueeze(-1) < cdf).float()  # [B, N]
+        return torch.argmax(sample, dim=1)
+
+
+# === rbdo6/variable/chi_square.py ===
+# ============================================================
+# File        : chisquare.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Chi-Square random variable using
+#               inverse CDF sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class ChiSquare(RandomVariable):
+    """
+    Chi-Square random variable with degrees of freedom ν.
+
+    Transforms standard normal samples into Chi-Square distributed values
+    via inverse CDF (quantile function) sampling.
+
+    Attributes:
+        df (DesignVariable or float): Degrees of freedom (ν > 0).
+    """
+
+    def __init__(self, df):
+        """
+        Initializes a Chi-Square random variable and registers it with the context.
+
+        Args:
+            df (float or DesignVariable): Degrees of freedom.
+        """
+        super().__init__()
+        self.df = df
+
+    def sample(self, z_i):
+        """
+        Samples from the Chi-Square distribution using inverse transform sampling.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from the Chi-Square(ν) distribution (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
+        df = self.get_value(self.df)
+        dist = torch.distributions.Chi2(df)
+        return dist.icdf(U)
+
+
+# === rbdo6/variable/design.py ===
+# ============================================================
+# File        : design.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Defines the DesignVariable class that registers
+#               with the active Context and enables access to
+#               batched design values via index-based lookup.
+# ============================================================
+
+from ..core import Context
+
+
+class DesignVariable:
+    """
+    Represents a design variable in the RBDO computational graph.
+
+    Upon construction, the variable is automatically registered
+    with the current Context. It retrieves its current value via
+    indexing into the design variable tensor `v` stored in Context.
+
+    Attributes:
+        name (str): The name of the design variable (for debugging/logging).
+        _id (int): Index in the Context's design variable list (set on registration).
+        _value (float): Initial value (only used for logging or potential defaults).
+    """
+
+    def __init__(self, name, value):
+        """
+        Initializes and registers the design variable with the current context.
+
+        Args:
+            name (str): A unique identifier for the design variable.
+            value (float): The initial (default) value of the variable.
+        """
+        self.name = name
+        self._id = None
+        self._value = value
+        Context.active().register_design(self)
+
+    def value(self):
+        """
+        Returns the batched values of this design variable.
+
+        Returns:
+            torch.Tensor: A 1D tensor of shape [B], where B is the batch size.
+        """
+        return Context.active().v[:, self._id]
+
+
+# === rbdo6/variable/exponential.py ===
+# ============================================================
+# File        : exponential.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Exponential random variable using
+#               inverse CDF sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Exponential(RandomVariable):
+    """
+    Exponential random variable with a rate parameter λ.
+
+    Transforms standard normal samples into exponential values using
+    inverse transform sampling:
+        X = -ln(1 - U) / λ, where U = Φ(z)
+
+    Attributes:
+        rate (DesignVariable or float): Rate parameter (λ > 0).
+    """
+
+    def __init__(self, rate):
+        """
+        Initializes an Exponential random variable and registers it with the context.
+
+        Args:
+            rate (float or DesignVariable): Rate parameter λ.
+        """
+        super().__init__()
+        self.rate = rate
+
+    def sample(self, z_i):
+        """
+        Samples from the Exponential distribution using inverse transform sampling.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from the Exponential(λ) distribution (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
+        rate = self.get_value(self.rate)
+        return -torch.log(1 - U) / rate
+
+
+# === rbdo6/variable/gamma.py ===
+# ============================================================
+# File        : gamma.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Gamma random variable using
+#               inverse CDF sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Gamma(RandomVariable):
+    """
+    Gamma random variable with concentration and rate parameters.
+
+    Transforms standard normal samples into Gamma-distributed values
+    via inverse CDF (percent-point function) sampling.
+
+    Attributes:
+        concentration (DesignVariable or float): Shape parameter (α > 0).
+        rate (DesignVariable or float): Rate parameter (β > 0).
+    """
+
+    def __init__(self, concentration, rate):
+        """
+        Initializes a Gamma random variable and registers it with the context.
+
+        Args:
+            concentration (float or DesignVariable): Shape parameter α.
+            rate (float or DesignVariable): Rate parameter β.
+        """
+        super().__init__()
+        self.concentration = concentration
+        self.rate = rate
+
+    def sample(self, z_i):
+        """
+        Samples from the Gamma distribution using inverse transform sampling.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from the Gamma(α, β) distribution (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        concentration = self.get_value(self.concentration)
+        rate = self.get_value(self.rate)
+        dist = torch.distributions.Gamma(concentration, rate)
+        return dist.icdf(U)
+
+
+# === rbdo6/variable/logistic.py ===
+# ============================================================
+# File        : logistic.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Logistic random variable using
+#               inverse CDF sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Logistic(RandomVariable):
+    """
+    Logistic random variable with location and scale parameters.
+
+    Standard normal samples z_i are transformed to uniform values via the normal CDF,
+    and then mapped to logistic samples via the inverse CDF:
+        X = loc + scale * log(U / (1 - U))
+
+    Attributes:
+        loc (DesignVariable or float): Location parameter (mean).
+        scale (DesignVariable or float): Scale parameter (> 0).
+    """
+
+    def __init__(self, loc, scale):
+        """
+        Initializes a Logistic random variable and registers it with the context.
+
+        Args:
+            loc (float or DesignVariable): Location parameter.
+            scale (float or DesignVariable): Scale parameter.
+        """
+        super().__init__()
+        self.loc = loc
+        self.scale = scale
+
+    def sample(self, z_i):
+        """
+        Samples from the Logistic distribution using inverse transform sampling.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from the Logistic distribution (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        loc = self.get_value(self.loc)
+        scale = self.get_value(self.scale)
+        return loc + scale * torch.log(U / (1 - U))
+
+
+# === rbdo6/variable/lognormal.py ===
+# ============================================================
+# File        : lognormal.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Lognormal random variable using
+#               exponential transformation of standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class LogNormal(RandomVariable):
+    """
+    Lognormal random variable defined by parameters μ and σ of the underlying normal distribution.
+
+    The transformation is applied as:
+        X = exp(μ + σ * z),  with z ~ N(0, 1)
+
+    Attributes:
+        mu (DesignVariable or float): Mean of the underlying normal distribution.
+        sigma (DesignVariable or float): Standard deviation of the underlying normal distribution.
+    """
+
+    def __init__(self, mu, sigma):
+        """
+        Initializes a Lognormal random variable and registers it with the context.
+
+        Args:
+            mu (float or DesignVariable): Mean of the underlying normal distribution.
+            sigma (float or DesignVariable): Standard deviation.
+        """
+        super().__init__()
+        self.mu = mu
+        self.sigma = sigma
+
+    def sample(self, z_i):
+        """
+        Samples from the Lognormal distribution using exponential transformation.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from Lognormal(μ, σ) (shape [B]).
+        """
+        mu = self.get_value(self.mu)
+        sigma = self.get_value(self.sigma)
+        return torch.exp(mu + sigma * z_i)
+
+
+# === rbdo6/variable/normal.py ===
+# ============================================================
+# File        : normal.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Normal (Gaussian) random variable
+#               using a linear transformation of standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Normal(RandomVariable):
+    """
+    Normal (Gaussian) random variable N(μ, σ), supporting both
+    constant and design-dependent parameters.
+
+    Attributes:
+        mu (DesignVariable or float): Mean of the distribution.
+        sigma (DesignVariable or float): Standard deviation (σ > 0).
+    """
+
+    def __init__(self, mu, sigma):
+        """
+        Initializes a Normal random variable and registers it with the context.
+
+        Args:
+            mu (float or DesignVariable): Mean value.
+            sigma (float or DesignVariable): Standard deviation.
+        """
+        super().__init__()
+        self.mu = mu
+        self.sigma = sigma
+
+    def sample(self, z_i):
+        """
+        Samples from the Normal distribution using standard transformation:
+        X = μ + σ * z_i, where z_i ~ N(0,1)
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from N(μ, σ) (shape [B]).
+        """
+        mu = self.get_value(self.mu)
+        sigma = self.get_value(self.sigma)
+        return mu + sigma * z_i
+
+
+# === rbdo6/variable/poisson.py ===
+# ============================================================
+# File        : poisson.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Poisson random variable using
+#               inverse CDF sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Poisson(RandomVariable):
+    """
+    Poisson random variable with rate λ.
+
+    Transforms standard normal samples into Poisson-distributed integer values
+    using the inverse CDF (quantile) method via the torch.distributions API.
+
+    Attributes:
+        rate (DesignVariable or float): Rate parameter λ (> 0).
+    """
+
+    def __init__(self, rate):
+        """
+        Initializes a Poisson random variable and registers it with the context.
+
+        Args:
+            rate (float or DesignVariable): Expected number of events (λ).
+        """
+        super().__init__()
+        self.rate = rate
+
+    def sample(self, z_i):
+        """
+        Samples from the Poisson distribution using inverse transform sampling.
+
+        The standard normal input `z_i` is mapped to the uniform domain via
+        the normal CDF, and then passed through the inverse CDF of the Poisson distribution.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Integer-valued samples from the Poisson distribution (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        rate = self.get_value(self.rate)
+        dist = torch.distributions.Poisson(rate)
+        return dist.icdf(U)
+
+
+# === rbdo6/variable/random.py ===
+# ============================================================
+# File        : random.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Base class for all random variables, providing
+#               registration in the active Context and utilities
+#               for resolving design-dependent parameters.
+# ============================================================
+
+import torch
+from ..core import Context
+from .design import DesignVariable
+
+
+class RandomVariable:
+    """
+    Abstract base class for all random variables used in the RBDO framework.
+
+    Each instance is automatically registered in the active Context to
+    assign a unique ID for sampling and transformation.
+
+    Subclasses must override the `sample(z_i)` method to define how standard
+    normal inputs are mapped to physical space.
+    """
+
+    def __init__(self):
+        """
+        Registers the random variable with the active Context.
+        """
+        self._id = None
+        Context.active().register_random(self)
+
+    def sample(self, z_i):
+        """
+        Transforms standard normal samples to physical space.
+        This must be implemented by subclasses.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples.
+
+        Returns:
+            torch.Tensor: Transformed physical-space values.
+        """
+        raise NotImplementedError("RandomVariable subclasses must implement sample(z_i).")
+
+    @staticmethod
+    def get_value(x):
+        """
+        Returns the tensor value of a DesignVariable or converts constants to tensors.
+
+        Args:
+            x (float | torch.Tensor | DesignVariable): Input parameter.
+
+        Returns:
+            torch.Tensor: Tensor representation of the value.
+        """
+        if isinstance(x, DesignVariable):
+            return x.value()
+        elif isinstance(x, (float, int)):
+            return torch.tensor(x, dtype=torch.float32)
+        return x
+
+
+# === rbdo6/variable/student_t.py ===
+# ============================================================
+# File        : studentt.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Student-t random variable using
+#               inverse CDF sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class StudentT(RandomVariable):
+    """
+    Student-t random variable with support for design-dependent parameters.
+
+    Transforms standard normal samples `z_i` into Student-t distributed values
+    via the inverse CDF (percent point function) method.
+
+    Attributes:
+        df (DesignVariable or float): Degrees of freedom (ν > 0).
+        loc (DesignVariable or float): Location parameter (mean).
+        scale (DesignVariable or float): Scale parameter (> 0).
+    """
+
+    def __init__(self, df, loc, scale):
+        """
+        Initializes a Student-t random variable and registers it with the context.
+
+        Args:
+            df (float or DesignVariable): Degrees of freedom.
+            loc (float or DesignVariable): Location (mean).
+            scale (float or DesignVariable): Scale parameter.
+        """
+        super().__init__()
+        self.df = df
+        self.loc = loc
+        self.scale = scale
+
+    def sample(self, z_i):
+        """
+        Samples from the Student-t distribution using inverse transform sampling.
+
+        Standard normal input z_i is mapped to the uniform domain via the
+        normal CDF, and then transformed using the inverse CDF of Student-t.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from the Student-t distribution (shape [B]).
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        df    = self.get_value(self.df)
+        loc   = self.get_value(self.loc)
+        scale = self.get_value(self.scale)
+        dist = torch.distributions.StudentT(df, loc, scale)
+        return dist.icdf(U)
+
+
+# === rbdo6/variable/uniform.py ===
+# ============================================================
+# File        : uniform.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Uniform random variable using
+#               inverse transform sampling from standard normal samples.
+# ============================================================
+
+import torch
+from torch.special import erf
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Uniform(RandomVariable):
+    """
+    Uniform random variable U(a, b), supporting both fixed bounds
+    and design-dependent parameters.
+
+    Standard normal samples z_i ∈ N(0,1) are transformed to uniform
+    samples in [a, b] using inverse transform sampling:
+        1. u = Φ(z_i) maps z_i to [0, 1] using the standard normal CDF
+        2. x = a + u * (b - a) maps to [a, b]
+
+    Attributes:
+        a (DesignVariable or float): Lower bound of the distribution.
+        b (DesignVariable or float): Upper bound of the distribution.
+    """
+
+    def __init__(self, a, b):
+        """
+        Initializes a Uniform random variable and registers it with the context.
+
+        Args:
+            a (float or DesignVariable): Lower bound of the distribution.
+            b (float or DesignVariable): Upper bound of the distribution.
+        """
+        super().__init__()
+        self.a = a
+        self.b = b
+
+    def sample(self, z_i: torch.Tensor) -> torch.Tensor:
+        """
+        Transforms standard normal samples into uniform [a, b] samples.
+
+        This uses the inverse transform sampling approach:
+            u = Φ(z_i) = 0.5 * (1 + erf(z_i / sqrt(2)))
+            x = a + u * (b - a)
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from Uniform(a, b) (shape [B]).
+        """
+        a = self.get_value(self.a)
+        b = self.get_value(self.b)
+
+        # Compute standard normal CDF
+        u = 0.5 * (1.0 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0, dtype=z_i.dtype, device=z_i.device))))
+        return a + u * (b - a)
+
+
+# === rbdo6/variable/weibull.py ===
+# ============================================================
+# File        : weibull.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Implements the Weibull random variable with
+#               inverse CDF sampling from standard normal input.
+# ============================================================
+
+import torch
+from .random import RandomVariable
+from .design import DesignVariable
+
+
+class Weibull(RandomVariable):
+    """
+    Weibull random variable defined by a scale and concentration parameter.
+
+    The transformation from standard normal samples to physical values is
+    performed via the inverse cumulative distribution function (inverse CDF).
+
+    The standard normal samples `z_i` are first mapped to uniform samples via
+    the standard normal CDF, then mapped to the Weibull distribution.
+
+    Attributes:
+        scale (DesignVariable or float): Scale parameter (λ > 0).
+        concentration (DesignVariable or float): Shape parameter (k > 0).
+    """
+
+    def __init__(self, scale, concentration):
+        """
+        Initializes a Weibull random variable and registers it with the context.
+
+        Args:
+            scale (DesignVariable or float): Scale parameter (λ).
+            concentration (DesignVariable or float): Shape parameter (k).
+        """
+        super().__init__()
+        self.scale = scale
+        self.concentration = concentration
+
+    def sample(self, z_i):
+        """
+        Samples from the Weibull distribution by applying the inverse CDF
+        to standard normal input samples.
+
+        Args:
+            z_i (torch.Tensor): Standard normal samples (shape [B]).
+
+        Returns:
+            torch.Tensor: Samples from the Weibull distribution.
+        """
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        scale = self.get_value(self.scale)
+        concentration = self.get_value(self.concentration)
+        return scale * torch.pow(-torch.log(1 - U), 1.0 / concentration)
+
+
+# === rbdo6/variable/__init__.py ===
+# ============================================================
+# File        : __init__.py
+# Project     : Reliability-Based Design Optimization
+# Author      : Finn Eggers
+# Description : Aggregates all available random variable types and
+#               the design variable interface for unified import.
+# ============================================================
+
+# --- Random variable classes ---
+from .normal       import Normal
+from .lognormal    import LogNormal
+from .uniform      import Uniform
+from .exponential  import Exponential
+from .gamma        import Gamma
+from .beta         import Beta
+from .weibull      import Weibull
+from .student_t    import StudentT
+from .chi_square   import ChiSquare
+from .poisson      import Poisson
+from .bernoulli    import Bernoulli
+from .categorical  import Categorical
+from .logistic     import Logistic
+
+# --- Core classes ---
+from .design       import DesignVariable
+from .random       import RandomVariable
+
+# --- Exported symbols (optional) ---
+__all__ = [
+    "Normal", "LogNormal", "Uniform", "Exponential",
+    "Gamma", "Beta", "Weibull", "StudentT", "ChiSquare",
+    "Poisson", "Bernoulli", "Categorical", "Logistic",
+    "DesignVariable", "RandomVariable"
+]
+
+
+# === rbdo6/variable/__pycache__/bernoulli.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/beta.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/categorical.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/chi_square.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/design.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/exponential.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/gamma.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/logistic.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/lognormal.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/normal.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/poisson.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/random.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/student_t.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/uniform.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/weibull.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/variable/__pycache__/__init__.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
+# === rbdo6/__pycache__/__init__.cpython-311.pyc ===
+[Could not read file: 'utf-8' codec can't decode byte 0xa7 in position 0: invalid start byte]
+
+
