@@ -14,19 +14,20 @@ from ..core import Node, Context
 
 class FORMFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, form_node, g_node, u, v, max_iter, tol, eta):
+    def forward(ctx, form_node, g_node, g, u, v, max_iter, tol, eta):
         with torch.enable_grad():
             B, n_u = u.shape
+            u = u.detach()
+            v = v.detach()
+
             ctx.g_node = g_node
-            ctx.u = u
-            ctx.v = v
             ctx.max_iter = max_iter
             ctx.tol = tol
             ctx.eta = eta
             ctx.form_node = form_node
 
             ctx.u_star = torch.zeros_like(u)
-            ctx.beta = torch.zeros(B, device=u.device, dtype=u.dtype)
+            beta = torch.zeros(B, device=u.device, dtype=u.dtype)
             ctx.du = []
             ctx.dv = []
 
@@ -36,14 +37,12 @@ class FORMFunction(torch.autograd.Function):
                 u_b = torch.zeros(n_u, device=u.device, dtype=u.dtype)
                 v_b = v[b]
 
-                # Evaluate g at origin to determine sign of β
                 g0_tmp = torch.zeros(1, n_u, device=u.device, dtype=u.dtype).requires_grad_(True)
                 v_tmp = v_b.unsqueeze(0).clone().detach().requires_grad_(True)
-                Context.active().set_inputs(g0_tmp, v_tmp)
+
                 res0 = g_node.call(u=g0_tmp, v=v_tmp, grad=False)
                 sign = -1.0 if res0["out"].item() < 0 else 1.0
 
-                # HLRF Iteration
                 for _ in range(max_iter):
                     u_tmp = u_b.unsqueeze(0).clone().detach().requires_grad_(True)
                     v_tmp = v_b.unsqueeze(0).clone().detach().requires_grad_(True)
@@ -63,10 +62,8 @@ class FORMFunction(torch.autograd.Function):
                         break
                     u_b = u_new
 
-                # Final call to get gradients at u*
                 u_tmp = u_b.unsqueeze(0).clone().detach().requires_grad_(True)
                 v_tmp = v_b.unsqueeze(0).clone().detach().requires_grad_(True)
-                Context.active().set_inputs(u_tmp, v_tmp)
 
                 res = g_node.call(u=u_tmp, v=v_tmp, grad=True)
                 du = res["grad_u"].squeeze(0)
@@ -77,39 +74,33 @@ class FORMFunction(torch.autograd.Function):
 
                 pf_out[b] = pf_val
                 ctx.u_star[b] = u_b
-                ctx.beta[b] = β
+                beta[b] = β
                 ctx.du.append(du)
                 ctx.dv.append(dv)
 
-            # Store result on the calling FORM instance
-            form_node._last_beta = ctx.beta.detach().clone()
+            form_node._last_u_star = ctx.u_star.detach().clone()
+            form_node._last_beta = beta.detach().clone()
+            ctx.save_for_backward(beta)
 
             return pf_out
 
     @staticmethod
     def backward(ctx, grad_out):
-        u, v = ctx.u, ctx.v
-        B, n_u = u.shape
-        n_v = v.shape[1]
-        grad_u = torch.zeros_like(u)
-        grad_v = torch.zeros_like(v)
+        (beta,) = ctx.saved_tensors
+        B = grad_out.shape[0]
+        grad_g = torch.zeros(B, device=grad_out.device)
 
+        print(B)
         for b in range(B):
-            du = ctx.du[b]
-            dv = ctx.dv[b]
-            β = ctx.beta[b]
-            norm_du = du.norm().item()
-
+            norm_du = ctx.du[b].norm().item()
             if norm_du == 0.0:
                 dpf_dg = 0.0
             else:
-                dpf_dg = -math.exp(-β.item() ** 2 / 2.0) / math.sqrt(2.0 * math.pi) / norm_du
+                dpf_dg = -math.exp(-beta[b].item()**2 / 2.0) / math.sqrt(2.0 * math.pi) / norm_du
 
-            grad_u[b] = dpf_dg * du * grad_out[b]
-            grad_v[b] = dpf_dg * dv * grad_out[b]
+            grad_g[b] = dpf_dg * grad_out[b]
 
-        return None, None, grad_u, grad_v, None, None, None
-
+        return None, None, grad_g, None, None, None, None, None
 
 class FORM(Node):
     """
@@ -128,32 +119,32 @@ class FORM(Node):
             tol (float): Convergence tolerance.
             eta (float): Step size factor for HL-RF update.
         """
-        super().__init__([g_node])
+        u_node = Context.active().u_node
+        v_node = Context.active().v_node
+        super().__init__([g_node, u_node, v_node])
+
         self.g_node = g_node
         self.max_iter = max_iter
         self.tol = tol
         self.eta = eta
         self._last_beta = None  # updated after each forward pass
 
-    def forward(self, ctx: Context, *_):
-        """
-        Executes the HL-RF algorithm and returns Pf.
+    def forward(self, ctx: Context, g, u, v):
+        _u = u.detach()
+        _v = v.detach()
 
-        Args:
-            ctx (Context): Active computation context.
-
-        Returns:
-            torch.Tensor: Vector of failure probabilities (shape [B]).
-        """
-        u, v = ctx.u, ctx.v
-        pf = FORMFunction.apply(self, self.g_node, u, v, self.max_iter, self.tol, self.eta)
+        pf = FORMFunction.apply(self, self.g_node, g, _u, _v, self.max_iter, self.tol, self.eta)
         return pf
 
     def beta(self):
+        """Returns the β indices from the last forward pass."""
+        return self._last_beta
+
+    def u_star(self):
         """
-        Returns the reliability indices β from the most recent forward pass.
+        Returns the u* design points from the last forward pass.
 
         Returns:
-            torch.Tensor: Tensor of β values (shape [B]) or None if not computed.
+            torch.Tensor: Tensor of shape [B, n_u] containing the HL-RF solution points.
         """
-        return self._last_beta
+        return self._last_u_star

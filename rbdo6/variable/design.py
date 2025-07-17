@@ -37,11 +37,11 @@ class DesignVariable:
         self._value = value
         Context.active().register_design(self)
 
-    def value(self):
+    def value(self, v):
         """
         Returns the batched values of this design variable.
 
         Returns:
             torch.Tensor: A 1D tensor of shape [B], where B is the batch size.
         """
-        return Context.active().v[:, self._id]
+        return v[:, self._id]

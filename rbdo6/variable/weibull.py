@@ -38,18 +38,19 @@ class Weibull(RandomVariable):
         self.scale = scale
         self.concentration = concentration
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Weibull distribution by applying the inverse CDF
-        to standard normal input samples.
+        Transforms standard normal input to a Weibull distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples from the Weibull distribution.
+            Tensor: Sample from Weibull(scale, concentration).
         """
         U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
-        scale = self.get_value(self.scale)
-        concentration = self.get_value(self.concentration)
+        scale = self.get_value(self.scale, v)
+        concentration = self.get_value(self.concentration, v)
         return scale * torch.pow(-torch.log(1 - U), 1.0 / concentration)
+

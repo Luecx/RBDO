@@ -36,17 +36,19 @@ class Logistic(RandomVariable):
         self.loc = loc
         self.scale = scale
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Logistic distribution using inverse transform sampling.
+        Transforms standard normal input to a logistic distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples from the Logistic distribution (shape [B]).
+            Tensor: Sample from Logistic(loc, scale).
         """
         U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
-        loc = self.get_value(self.loc)
-        scale = self.get_value(self.scale)
+        loc = self.get_value(self.loc, v)
+        scale = self.get_value(self.scale, v)
         return loc + scale * torch.log(U / (1 - U))
+

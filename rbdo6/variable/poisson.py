@@ -32,20 +32,19 @@ class Poisson(RandomVariable):
         super().__init__()
         self.rate = rate
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Poisson distribution using inverse transform sampling.
-
-        The standard normal input `z_i` is mapped to the uniform domain via
-        the normal CDF, and then passed through the inverse CDF of the Poisson distribution.
+        Transforms standard normal input to a Poisson distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Integer-valued samples from the Poisson distribution (shape [B]).
+            Tensor: Sample from Poisson(rate).
         """
         U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
-        rate = self.get_value(self.rate)
+        rate = self.get_value(self.rate, v)
         dist = torch.distributions.Poisson(rate)
         return dist.icdf(U)
+

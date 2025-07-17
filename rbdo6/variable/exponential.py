@@ -33,16 +33,18 @@ class Exponential(RandomVariable):
         super().__init__()
         self.rate = rate
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Exponential distribution using inverse transform sampling.
+        Transforms standard normal input to an exponential distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples from the Exponential(λ) distribution (shape [B]).
+            Tensor: Sample from Exp(rate).
         """
-        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
-        rate = self.get_value(self.rate)
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        rate = self.get_value(self.rate, v)
         return -torch.log(1 - U) / rate
+

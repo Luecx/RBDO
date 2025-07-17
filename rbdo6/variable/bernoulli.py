@@ -32,16 +32,17 @@ class Bernoulli(RandomVariable):
         super().__init__()
         self.p = p
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Bernoulli distribution using inverse transform sampling.
+        Transforms standard normal input to a Bernoulli outcome using inverse transform.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples of 0 or 1 from the Bernoulli(p) distribution (shape [B]).
+            Tensor: Sample from Bernoulli(p) as 0.0 or 1.0.
         """
-        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
-        p = self.get_value(self.p)
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        p = self.get_value(self.p, v)
         return (U < p).float()

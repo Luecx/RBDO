@@ -38,22 +38,21 @@ class StudentT(RandomVariable):
         self.loc = loc
         self.scale = scale
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Student-t distribution using inverse transform sampling.
-
-        Standard normal input z_i is mapped to the uniform domain via the
-        normal CDF, and then transformed using the inverse CDF of Student-t.
+        Transforms standard normal input to a Student-t distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples from the Student-t distribution (shape [B]).
+            Tensor: Sample from StudentT(df, loc, scale).
         """
         U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
-        df    = self.get_value(self.df)
-        loc   = self.get_value(self.loc)
-        scale = self.get_value(self.scale)
+        df = self.get_value(self.df, v)
+        loc = self.get_value(self.loc, v)
+        scale = self.get_value(self.scale, v)
         dist = torch.distributions.StudentT(df, loc, scale)
         return dist.icdf(U)
+

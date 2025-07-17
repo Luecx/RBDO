@@ -31,14 +31,26 @@ class Context:
         """
         self.design = []  # List of registered design variables
         self.random = []  # List of registered random variables
-        self.u = None     # Input vector in standard normal space
-        self.v = None     # Input vector for design variables
+        # self.u = None     # Input vector in standard normal space
+        # self.v = None     # Input vector for design variables
 
         self.stats = {
             "forward_calls": 0,
             "blackbox_forward": 0,
             "blackbox_backward": 0
         }
+
+        # create nodes
+        from .node_input import UNode, VNode
+        self.u_node = UNode()
+        self.v_node = VNode()
+
+        # call ids so that calls know its dependencies
+        self.call_id = 0
+
+    def _next_call_id(self):
+        self.call_id += 1
+        return self.call_id
 
     def __enter__(self):
         """
@@ -72,28 +84,6 @@ class Context:
         """
         var._id = len(self.random)
         self.random.append(var)
-
-    def set_inputs(self, u, v):
-        """
-        Sets the batched input values for u (standard normal) and v (design space).
-
-        Both u and v must be 2D tensors with gradients enabled for backpropagation.
-
-        Args:
-            u (torch.Tensor): Standard normal inputs of shape [B, n_u] or [n_u].
-            v (torch.Tensor): Design variable inputs of shape [B, n_v] or [n_v].
-        """
-        if u.ndim == 1:
-            u = u.unsqueeze(0)
-        if v.ndim == 1:
-            v = v.unsqueeze(0)
-        if not u.requires_grad:
-            u = u.clone().detach().requires_grad_(True)
-        if not v.requires_grad:
-            v = v.clone().detach().requires_grad_(True)
-
-        self.u = u
-        self.v = v
 
     @staticmethod
     def active():

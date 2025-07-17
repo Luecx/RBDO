@@ -32,17 +32,18 @@ class ChiSquare(RandomVariable):
         super().__init__()
         self.df = df
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Chi-Square distribution using inverse transform sampling.
+        Transforms standard normal input to a chi-squared distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples from the Chi-Square(ν) distribution (shape [B]).
+            Tensor: Sample from Chi2(df).
         """
-        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
-        df = self.get_value(self.df)
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        df = self.get_value(self.df, v)
         dist = torch.distributions.Chi2(df)
         return dist.icdf(U)

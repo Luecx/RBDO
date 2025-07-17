@@ -39,23 +39,18 @@ class Uniform(RandomVariable):
         self.a = a
         self.b = b
 
-    def sample(self, z_i: torch.Tensor) -> torch.Tensor:
+    def sample(self, z_i, v=None):
         """
-        Transforms standard normal samples into uniform [a, b] samples.
-
-        This uses the inverse transform sampling approach:
-            u = Φ(z_i) = 0.5 * (1 + erf(z_i / sqrt(2)))
-            x = a + u * (b - a)
+        Transforms standard normal input to a uniform distribution using inverse CDF.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples from Uniform(a, b) (shape [B]).
+            Tensor: Sample from U(a, b).
         """
-        a = self.get_value(self.a)
-        b = self.get_value(self.b)
-
-        # Compute standard normal CDF
-        u = 0.5 * (1.0 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0, dtype=z_i.dtype, device=z_i.device))))
-        return a + u * (b - a)
+        a = self.get_value(self.a, v)
+        b = self.get_value(self.b, v)
+        u_std = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0, dtype=z_i.dtype, device=z_i.device))))
+        return a + u_std * (b - a)

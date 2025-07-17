@@ -35,16 +35,18 @@ class LogNormal(RandomVariable):
         self.mu = mu
         self.sigma = sigma
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Lognormal distribution using exponential transformation.
+        Transforms standard normal input to a lognormal distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values [B, n_v].
 
         Returns:
-            torch.Tensor: Samples from Lognormal(μ, σ) (shape [B]).
+            Tensor: Sample from LogNormal(mu, sigma).
         """
-        mu = self.get_value(self.mu)
-        sigma = self.get_value(self.sigma)
+        mu = self.get_value(self.mu, v)
+        sigma = self.get_value(self.sigma, v)
         return torch.exp(mu + sigma * z_i)
+

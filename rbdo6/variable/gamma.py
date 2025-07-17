@@ -35,18 +35,20 @@ class Gamma(RandomVariable):
         self.concentration = concentration
         self.rate = rate
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Gamma distribution using inverse transform sampling.
+        Transforms standard normal input to a gamma distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples from the Gamma(α, β) distribution (shape [B]).
+            Tensor: Sample from Gamma(concentration, rate).
         """
         U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
-        concentration = self.get_value(self.concentration)
-        rate = self.get_value(self.rate)
+        concentration = self.get_value(self.concentration, v)
+        rate = self.get_value(self.rate, v)
         dist = torch.distributions.Gamma(concentration, rate)
         return dist.icdf(U)
+

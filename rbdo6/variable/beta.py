@@ -35,18 +35,20 @@ class Beta(RandomVariable):
         self.alpha = alpha
         self.beta = beta
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples from the Beta distribution using inverse transform sampling.
+        Transforms standard normal input to a beta distribution.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Samples from the Beta(α, β) distribution (shape [B]).
+            Tensor: Sample from Beta(alpha, beta).
         """
-        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
-        alpha = self.get_value(self.alpha)
-        beta  = self.get_value(self.beta)
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        alpha = self.get_value(self.alpha, v)
+        beta = self.get_value(self.beta, v)
         dist = torch.distributions.Beta(alpha, beta)
         return dist.icdf(U)
+

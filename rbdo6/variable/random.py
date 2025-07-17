@@ -30,7 +30,7 @@ class RandomVariable:
         self._id = None
         Context.active().register_random(self)
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
         Transforms standard normal samples to physical space.
         This must be implemented by subclasses.
@@ -44,18 +44,21 @@ class RandomVariable:
         raise NotImplementedError("RandomVariable subclasses must implement sample(z_i).")
 
     @staticmethod
-    def get_value(x):
+    def get_value(x, v=None):
         """
-        Returns the tensor value of a DesignVariable or converts constants to tensors.
+        Resolves constant or DesignVariable to a tensor using provided design vector `v`.
 
         Args:
-            x (float | torch.Tensor | DesignVariable): Input parameter.
+            x (float | Tensor | DesignVariable)
+            v (Tensor): [B, n_v] design tensor (required if x is DesignVariable)
 
         Returns:
-            torch.Tensor: Tensor representation of the value.
+            Tensor: [B] values
         """
         if isinstance(x, DesignVariable):
-            return x.value()
+            if v is None:
+                raise ValueError("DesignVariable requires 'v' input.")
+            return v[:, x._id]
         elif isinstance(x, (float, int)):
             return torch.tensor(x, dtype=torch.float32)
         return x

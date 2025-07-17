@@ -33,18 +33,19 @@ class Categorical(RandomVariable):
         super().__init__()
         self.probs = probs
 
-    def sample(self, z_i):
+    def sample(self, z_i, v=None):
         """
-        Samples category indices from the categorical distribution using inverse transform sampling.
+        Transforms standard normal input to a categorical sample.
 
         Args:
-            z_i (torch.Tensor): Standard normal samples (shape [B]).
+            z_i (Tensor): Standard normal input.
+            v (Tensor): Design variable values.
 
         Returns:
-            torch.Tensor: Sampled category indices (shape [B]).
+            Tensor: Integer indices of sampled categories.
         """
-        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))  # Φ(z_i)
-        probs = self.get_value(self.probs)  # [B, N]
-        cdf = torch.cumsum(probs, dim=1)    # [B, N]
-        sample = (U.unsqueeze(-1) < cdf).float()  # [B, N]
+        U = 0.5 * (1 + torch.erf(z_i / torch.sqrt(torch.tensor(2.0))))
+        probs = self.get_value(self.probs, v)
+        cdf = torch.cumsum(probs, dim=1)
+        sample = (U.unsqueeze(-1) < cdf).float()
         return torch.argmax(sample, dim=1)
