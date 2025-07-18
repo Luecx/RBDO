@@ -63,8 +63,8 @@ class ImportanceSampling(Node):
             self._pf = log_pf.exp().item()
 
             # Debug
-            print(f"log(w) mean/std/min/max: {log_w.mean().item():.3f} {log_w.std().item():.3f} "
-                  f"{log_w.min().item():.3f} {log_w.max().item():.3f}")
+            # print(f"log(w) mean/std/min/max: {log_w.mean().item():.3f} {log_w.std().item():.3f} "
+            #       f"{log_w.min().item():.3f} {log_w.max().item():.3f}")
 
             return torch.tensor(self._pf, device=device, dtype=dtype)
 

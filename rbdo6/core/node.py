@@ -16,12 +16,14 @@ from torch.autograd.functional import hvp
 import torch
 
 class Node:
-    def __init__(self, inputs=None, *, kind=NodeKind.STANDARD,
+    def __init__(self, inputs=None, side_inputs=None,
+                 kind=NodeKind.STANDARD,
                  grad_provider=None,
                  hesse_provider=None,
                  hvp_provider=None):
 
-        self.inputs = inputs if inputs else []
+        self.inputs      = inputs if inputs else []
+        self.side_inputs = side_inputs if side_inputs else []
         self.kind = kind
 
         self.grad_provider  = grad_provider
@@ -42,18 +44,34 @@ class Node:
         raise NotImplementedError
 
     def get_inputs(self, u, v, _call_id):
-        values = []
+        tracked = []
+        untracked = []
+
         for inp in self.inputs:
             if isinstance(inp, Node):
                 if inp.kind == NodeKind.U:
-                    values.append(u)
+                    tracked.append(u)
                 elif inp.kind == NodeKind.V:
-                    values.append(v)
+                    tracked.append(v)
                 else:
-                    values.append(inp.call(u=u, v=v, _call_id=_call_id)["out"])
+                    tracked.append(inp.call(u=u, v=v, _call_id=_call_id)["out"])
             else:
-                values.append(inp)
-        return values
+                tracked.append(inp)
+
+        for inp in self.side_inputs:
+            if isinstance(inp, Node):
+                if inp.kind == NodeKind.U:
+                    untracked.append(u.detach())
+                elif inp.kind == NodeKind.V:
+                    untracked.append(v.detach())
+                else:
+                    untracked.append(inp.call(u=u, v=v, _call_id=_call_id)["out"].detach())
+            elif isinstance(inp, torch.Tensor):
+                untracked.append(inp.detach())
+            else:
+                untracked.append(inp)
+
+        return tracked, untracked
 
     def call(self, u=None, v=None, grad=False, gradgrad_u=False, gradgrad_v=False, hvp_u=None, hvp_v=None, _call_id=None):
         root = _call_id is None
@@ -67,10 +85,12 @@ class Node:
             _call_id = ctx._next_call_id()
 
         if _call_id != self._cache_key:
-            inputs = self.get_inputs(u, v, _call_id)
+            tracked_inputs, side_inputs = self.get_inputs(u, v, _call_id)
+            inputs = tracked_inputs + side_inputs
+
             ctx.stats["forward_calls"] += 1
             if self.grad_provider is not None:
-                out = CustomGradFunction.apply(self.grad_provider, lambda *x: self.forward(ctx, *x), *inputs)
+                out = CustomGradFunction.apply(self.grad_provider, lambda *x: self.forward(ctx, *x, *side_inputs), *tracked_inputs)
             else:
                 out = self.forward(ctx, *inputs)
         else:
