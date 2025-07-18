@@ -15,11 +15,17 @@ class CorrelationMatrix:
 
     Uses Cholesky decomposition to enable the Nataf transformation:
         z = u @ Lᵀ, where L is the Cholesky factor of R.
+
+    Attributes:
+        R (torch.Tensor): The correlation matrix [n × n].
+        L (torch.Tensor): The Cholesky factor of R (computed via compile()).
+        _dirty (bool): Tracks whether the matrix needs to be recompiled.
     """
 
     def __init__(self):
         """
         Initializes the correlation matrix based on Context.active().random.
+        Raises an error if no random variables are registered.
         """
         self.random_vars = Context.active().random
         self.n = len(self.random_vars)
@@ -31,36 +37,40 @@ class CorrelationMatrix:
         self.L = None
         self._dirty = True
 
-    def set_correlation(self, r1, r2, rho):
+    def set_correlation(self, r1, r2, rho: float):
         """
         Sets a correlation coefficient between two random variables.
 
         Args:
             r1 (RandomVariable): First variable.
             r2 (RandomVariable): Second variable.
-            rho (float): Correlation coefficient between r1 and r2.
+            rho (float): Correlation coefficient to assign.
         """
         i, j = r1._id, r2._id
         self.R[i, j] = self.R[j, i] = rho
         self._dirty = True
 
-    def compile(self):
+    def compile(self) -> torch.Tensor:
         """
-        Computes the Cholesky factor L of the correlation matrix.
+        Computes the Cholesky factor L of the correlation matrix R.
+
+        Returns:
+            torch.Tensor: The Cholesky factor L.
         """
         self.L = torch.linalg.cholesky(self.R).to(dtype=torch.float32)
         self._dirty = False
+        return self.L
 
-    def get_L(self):
+    def get_L(self) -> torch.Tensor:
         """
         Returns the Cholesky factor of the correlation matrix.
 
         Returns:
-            Tensor: The Cholesky factor L [n × n].
+            torch.Tensor: Cholesky factor L [n × n].
 
         Raises:
-            RuntimeError: If compile() has not been called.
+            RuntimeError: If the matrix has not been compiled.
         """
-        if self._dirty:
-            raise RuntimeError("CorrelationMatrix not compiled.")
+        if self._dirty or self.L is None:
+            raise RuntimeError("CorrelationMatrix has not been compiled. Call `.compile()` first.")
         return self.L

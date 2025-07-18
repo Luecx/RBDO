@@ -4,8 +4,6 @@
 # Author      : Finn Eggers
 # Description : Manages the global context for variable registration,
 #               sampling inputs, and tracking execution statistics.
-#               Provides access to design and random variables and
-#               ensures proper gradient handling for optimization.
 # ============================================================
 
 import torch
@@ -13,26 +11,23 @@ import torch
 
 class Context:
     """
-    Global context for managing design and random variables in RBDO.
+    Global context manager for RBDO computations.
 
     This context tracks:
     - Registered design and random variables
-    - Input values for u (standard normal) and v (design variables)
     - Execution statistics for forward and backward passes
+    - Input nodes for u (standard normal) and v (design variables)
+    - A call ID counter for dependency tracking
 
-    Only one context can be active at a time, and it must be accessed using a `with` statement.
+    Use this context via a `with` statement to ensure correct scoping.
     """
 
     _active = None  # Static reference to the currently active context
 
     def __init__(self):
-        """
-        Initializes an empty context with variable lists and statistics.
-        """
-        self.design = []  # List of registered design variables
-        self.random = []  # List of registered random variables
-        # self.u = None     # Input vector in standard normal space
-        # self.v = None     # Input vector for design variables
+        """Initializes a new context with variable lists and tracking."""
+        self.design = []  # List of registered DesignVariable instances
+        self.random = []  # List of registered RandomVariable instances
 
         self.stats = {
             "forward_calls": 0,
@@ -40,21 +35,30 @@ class Context:
             "blackbox_backward": 0
         }
 
-        # create nodes
+        # Input nodes for computational graph
         from .node_input import UNode, VNode
         self.u_node = UNode()
         self.v_node = VNode()
 
-        # call ids so that calls know its dependencies
+        # Unique call ID counter for graph dependency tracking
         self.call_id = 0
 
-    def _next_call_id(self):
+    def _next_call_id(self) -> int:
+        """
+        Increments and returns the next unique call ID.
+
+        Returns:
+            int: The next call ID.
+        """
         self.call_id += 1
         return self.call_id
 
-    def __enter__(self):
+    def __enter__(self) -> "Context":
         """
-        Enters the context, making it the globally active context.
+        Enters the context, making it the globally active one.
+
+        Returns:
+            Context: The active context instance.
         """
         Context._active = self
         return self
@@ -67,31 +71,31 @@ class Context:
 
     def register_design(self, var):
         """
-        Registers a design variable with the context.
+        Registers a design variable with this context.
 
         Args:
-            var: A DesignVariable instance.
+            var: A DesignVariable instance to register.
         """
         var._id = len(self.design)
         self.design.append(var)
 
     def register_random(self, var):
         """
-        Registers a random variable with the context.
+        Registers a random variable with this context.
 
         Args:
-            var: A RandomVariable instance.
+            var: A RandomVariable instance to register.
         """
         var._id = len(self.random)
         self.random.append(var)
 
     @staticmethod
-    def active():
+    def active() -> "Context":
         """
         Returns the currently active context.
 
         Returns:
-            Context: The currently active context.
+            Context: The active context instance.
 
         Raises:
             RuntimeError: If no context is currently active.

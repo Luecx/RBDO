@@ -19,7 +19,7 @@ class IndexNode(Node):
         index (int): Index of the column to extract from the input tensor.
     """
 
-    def __init__(self, index, source_node):
+    def __init__(self, index: int, source_node: Node):
         """
         Initializes an IndexNode that selects the i-th column from its input.
 
@@ -30,7 +30,7 @@ class IndexNode(Node):
         super().__init__([source_node])
         self.index = index
 
-    def forward(self, ctx, x):
+    def forward(self, ctx, x: torch.Tensor) -> torch.Tensor:
         """
         Forwards the selected column from the input.
 

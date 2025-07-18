@@ -10,4 +10,5 @@ from .context import Context
 from .node import Node
 from .index import IndexNode
 from .node_input import *
+from .node_type import *
 
